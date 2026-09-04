@@ -209,6 +209,9 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Operator-supplied ECU firmware
+*.bin
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
