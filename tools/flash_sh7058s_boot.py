@@ -20,7 +20,7 @@ from typing import Any, Callable, Sequence
 ROM_SIZE = 0x100000
 PROGRAM_UNIT = 0x80
 READBACK_UNIT = 0x1000
-RESERVED_PREFIX_SIZE = 0x2000
+PRIMARY_LOADER_SIZE = 0x2000
 INITIAL_BAUD = 9600
 DEFAULT_PROGRAM_BAUD = 38_400
 PROGRAM_BAUD_OPTIONS = (38_400, 62_500, 125_000, 206_900, 312_500, 625_000)
@@ -212,10 +212,10 @@ def build_image_plan(path: Path) -> ImagePlan:
         raise FlashToolError(
             f"expected a 1 MiB R4F70580S user-MAT image, got {len(data):,} bytes"
         )
-    if data[:RESERVED_PREFIX_SIZE] != b"\xFF" * RESERVED_PREFIX_SIZE:
+    if data[:PRIMARY_LOADER_SIZE] == b"\xFF" * PRIMARY_LOADER_SIZE:
         raise FlashToolError(
-            "the first 0x2000 bytes are not all 0xFF; this does not match the "
-            "supported NC ECU image layout"
+            "the first 0x2000 bytes are all 0xFF; cold recovery requires a "
+            "complete User-MAT image containing the EB0/EB1 primary loader"
         )
 
     chunks = tuple(
@@ -855,7 +855,10 @@ def _print_plan(
     for start, end in plan.ranges:
         _emit(f"  0x{start:08X}-0x{end:08X}  ({end - start + 1:,} bytes)")
     _emit("Cold transition erase: entire User MAT and separate User Boot MAT")
-    _emit("Restore scope:       User MAT only; User Boot MAT remains blank")
+    _emit(
+        "Restore scope:       complete User MAT including EB0/EB1; "
+        "User Boot MAT remains blank"
+    )
     _emit(
         "Validation scope:  size/layout and target silicon/geometry only; "
         "not ROM provenance or bootability"
@@ -1072,7 +1075,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "  - The full 1 MiB User MAT and separate 12 KiB User Boot MAT "
                 "are erased."
             )
-            _emit("  - Only the User MAT is restored; the User Boot MAT remains blank.")
+            _emit(
+                "  - The complete User MAT, including EB0/EB1, is restored; "
+                "the User Boot MAT remains blank."
+            )
             _emit(
                 "  - The input is not proven to be the correct ECU/ROM variant "
                 "or bootable."

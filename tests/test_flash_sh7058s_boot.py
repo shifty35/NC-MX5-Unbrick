@@ -20,6 +20,8 @@ def setUpModule() -> None:
     _test_image_directory = tempfile.TemporaryDirectory()
     TEST_IMAGE = Path(_test_image_directory.name) / "synthetic-test-image.bin"
     data = bytearray(b"\xFF" * flasher.ROM_SIZE)
+    data[0x0000:0x0080] = bytes(range(flasher.PROGRAM_UNIT))
+    data[0x1000:0x1080] = bytes(reversed(range(flasher.PROGRAM_UNIT)))
     data[0x2000:0x2080] = bytes(range(flasher.PROGRAM_UNIT))
     data[0x40000:0x40080] = b"\x00" * flasher.PROGRAM_UNIT
     TEST_IMAGE.write_bytes(data)
@@ -266,17 +268,21 @@ class ImagePlanTests(unittest.TestCase):
     def test_synthetic_image_plan(self) -> None:
         plan = flasher.build_image_plan(TEST_IMAGE)
         self.assertEqual(plan.sha256, hashlib.sha256(plan.data).hexdigest())
-        self.assertEqual(len(plan.chunks), 2)
-        self.assertEqual(plan.programmed_bytes, 256)
-        self.assertEqual(plan.chunks[0].address, 0x2000)
+        self.assertEqual(len(plan.chunks), 4)
+        self.assertEqual(plan.programmed_bytes, 512)
+        self.assertEqual(plan.chunks[0].address, 0x0000)
+        self.assertEqual(plan.chunks[1].address, 0x1000)
+        self.assertEqual(plan.chunks[2].address, 0x2000)
         self.assertEqual(plan.chunks[-1].address, 0x40000)
-        self.assertEqual(plan.erase_blocks, (2, 10))
+        self.assertEqual(plan.erase_blocks, (0, 1, 2, 10))
         self.assertEqual(plan.user_mat_sum, sum(plan.data) & 0xFFFFFFFF)
 
-    def test_rejects_wrong_size_reserved_data_and_blank_image(self) -> None:
+    def test_rejects_wrong_size_blank_primary_loader_and_blank_image(self) -> None:
+        blank_primary_loader = bytearray(b"\xFF" * flasher.ROM_SIZE)
+        blank_primary_loader[0x2000:0x2080] = b"\x00" * flasher.PROGRAM_UNIT
         cases = (
             b"\xFF" * 128,
-            b"\x00" + b"\xFF" * (flasher.ROM_SIZE - 1),
+            bytes(blank_primary_loader),
             b"\xFF" * flasher.ROM_SIZE,
         )
         for data in cases:
@@ -291,7 +297,7 @@ class ImagePlanTests(unittest.TestCase):
 class ProtocolTranscriptTests(unittest.TestCase):
     def test_cold_boot_program_and_sum_transcript(self) -> None:
         data = bytes(range(128))
-        chunk = flasher.ProgramChunk(0x2000, data)
+        chunk = flasher.ProgramChunk(0x0000, data)
         image = bytearray(b"\xFF" * flasher.ROM_SIZE)
         image[chunk.address : chunk.address + len(data)] = data
         expected_sum = sum(image) & 0xFFFFFFFF

@@ -8,8 +8,9 @@ KWP, or UDS flashing tool.
 > [!CAUTION]
 > A cold connection's mandatory programming-mode transition erases the complete
 > 1 MiB User MAT and the separate 12 KiB User Boot MAT. The input image restores
-> only the User MAT, so User Boot MAT remains blank. The tool makes no backup and
-> cannot safely resume an interrupted destructive command.
+> the complete User MAT, including the EB0/EB1 primary-loader region, but User
+> Boot MAT remains blank. The tool makes no backup and cannot safely resume an
+> interrupted destructive command.
 
 Read the [complete safety, electrical, protocol, baud-rate, verification, and
 recovery guide](SH7058S_BOOT_FLASHER.md) before connecting hardware. This
@@ -21,7 +22,8 @@ protected interface and stable fused bench power.
 
 - Python 3.10 or newer
 - `pyserial` for live serial operation
-- A legally obtained raw 1 MiB User-MAT image for the exact ECU/ROM variant
+- A legally obtained raw 1 MiB User-MAT image for the exact ECU/ROM variant,
+  including a nonblank `0x0000-0x1FFF` primary-loader region
 
 No Mazda firmware image is included. The tool validates image shape, target
 silicon identity, and flash geometry before erasure. It does not establish ROM
@@ -175,9 +177,10 @@ external verification is then required before attempting a normal boot.
 - `arduino/pulse_train/pulse_train.ino` — optional classic Nano pulse generator
 - `SH7058S_BOOT_FLASHER.md` — complete operating and protocol documentation
 
-The flasher programs every 128-byte image page that is not entirely `0xFF`.
-Interior `0xFF` bytes in a used page are retained. The cold transition erases
-the entire User MAT before sparse programming begins.
+The flasher programs every 128-byte image page from `0x000000` through
+`0x0FFFFF` that is not entirely `0xFF`. Interior `0xFF` bytes in a used page are
+retained. The cold transition erases the entire User MAT before sparse
+programming begins, so naturally blank pages retain the erased value.
 
 ## Tests
 

@@ -8,8 +8,8 @@ KWP, or UDS reflashing tool.
 Before it enables a destructive command, the tool requires the exact device
 code and product name, clock information, 1 MiB User MAT, 12 KiB User Boot MAT,
 16-block erase geometry, and 128-byte programming unit expected by this target.
-The input must be a raw 1 MiB User-MAT image whose `0x0000-0x1FFF` prefix is
-erased (`0xFF`).
+The input must be a complete raw 1 MiB User-MAT image containing a nonblank
+`0x0000-0x1FFF` EB0/EB1 primary-loader region.
 
 No Mazda firmware is distributed in this repository.
 
@@ -55,8 +55,8 @@ conditioning, so use an ECU-specific circuit and sequence.
 
 Cold boot is the only supported live mode. Its mandatory `0x40` transition
 erases the complete 1 MiB User MAT and the separate 12 KiB User Boot MAT before
-returning ACK. The input restores only User MAT; User Boot MAT remains blank,
-and no backup is made.
+returning ACK. The input restores the complete User MAT, including EB0/EB1;
+User Boot MAT remains blank, and no backup is made.
 
 Before starting:
 
@@ -214,18 +214,20 @@ port attribute is reassigned.
 The image gate requires:
 
 - exactly 1,048,576 bytes;
-- `0x0000-0x1FFF` entirely `0xFF`; and
+- a nonblank `0x0000-0x1FFF` EB0/EB1 primary-loader region; and
 - at least one nonblank 128-byte programming page.
 
 It does **not** establish Mazda/NC ECU identity, ROM variant compatibility,
 calibration correctness, internal checksum validity, provenance, or
 bootability. Printing SHA-256 is identification, not an allowlist.
 
-The flasher programs every 128-byte-aligned page that is not entirely `0xFF`.
+The flasher programs every 128-byte-aligned page from `0x000000` through
+`0x0FFFFF` that is not entirely `0xFF`, including nonblank pages in EB0 and EB1.
 It retains `0xFF` bytes inside a used page. This sparse write is safe only after
 the tool has received the documented automatic-erase completion ACK and proved
-both MATs blank. Non-`0xFF` pages must not be omitted merely because their data
-looks repetitive or zero-filled.
+both MATs blank. Naturally blank pages retain the erased value; non-`0xFF`
+pages must not be omitted merely because their data looks repetitive or
+zero-filled.
 
 Default verification uses the documented `0x52` memory-read command to compare
 the complete 1 MiB User MAT byte-for-byte and reports its SHA-256. A faster,
@@ -368,6 +370,10 @@ After ACK, it sends `0x4F` and requires the checksum-valid ready response:
 It then requires `0x4C` and `0x4D` to report User Boot MAT and User MAT blank
 before selecting User-MAT programming with `0x43`.
 
+Unlike the resident FDT capture, the cold path erases EB0 and EB1. The input
+therefore must contain the correct primary loader, and the subsequent `0x50`
+records restore its nonblank pages along with the rest of User MAT.
+
 Programming uses strict stop-and-wait records:
 
 ```text
@@ -428,6 +434,10 @@ The protocol and target geometry are documented by these primary sources:
 - [WCH USB-to-serial product selector](https://www.wch-ic.com/products/productsCenter/otherChip?categoryId=68)
 
 Offline tests do not prove the pyserial/USB path, electrical interface,
-diagnostic-pin mapping, boot-control wiring, default `0x52` readback on a
-physical ECU, or a successful normal boot. First use remains hardware
-validation and requires stable bench power plus a recoverable setup.
+diagnostic-pin mapping, boot-control wiring, or default `0x52` readback on a
+physical ECU. The operator has successfully normal-booted and run the vehicle
+with a complete image formed from the LFLPEB primary loader at
+`0x0000-0x1FFF` and the matching stock User-MAT contents at
+`0x2000-0x0FFFFF`. That result validates the complete-image layout used in
+that run, not every adapter, baud-rate, ECU, or ROM combination. First use on
+another setup still requires stable bench power plus a recoverable setup.

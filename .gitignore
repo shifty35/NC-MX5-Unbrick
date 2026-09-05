@@ -209,8 +209,9 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
-# Operator-supplied ECU firmware
+# Operator-supplied ECU firmware and ROMDrop analysis input
 *.bin
+/romdrop
 
 # Marimo
 marimo/_static/
