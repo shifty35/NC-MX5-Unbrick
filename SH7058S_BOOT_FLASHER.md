@@ -258,6 +258,28 @@ estimate; USB scheduling, software overhead, automatic erase, blank checks,
 and verification add time. The manual specifies up to 20 ms per programming
 record under its stated test conditions.
 
+Live operations also print measured timings. Each destructive phase reports
+its elapsed time, and the programming phase separates the record loop into
+time queueing serial `write` calls, time from there through outbound completion,
+ECU processing, and receipt of the per-record ACK, and remaining host
+framing/progress overhead. On POSIX systems, including macOS, ACK waits use the
+serial descriptor with `select()` so the process sleeps in the kernel until
+data is readable rather than polling every 5 ms. The live log states whether
+this event-driven path was selected. Transports without a selectable descriptor
+use a 0.5 ms sleeping fallback, not a busy loop. Program-record writes do not
+call `flush()`: receipt of the required ACK already proves that the complete
+record was transmitted and accepted. Control commands and programming
+termination retain their drain.
+
+The combined completion/ACK timing bucket includes remaining outbound wire/USB
+time after `write()` returns, ECU flash-programming time, ACK wire time, and
+host/USB receive wakeup; those components cannot be separated without an
+external logic-analyzer capture. One-percent progress reports include elapsed
+time, interval record rate, and ETA. A final summary reports automatic erase,
+post-erase checks, programming, optional verification, and total elapsed time
+after destructive confirmation. Failed or interrupted phases retain their
+elapsed measurement before the recovery warning.
+
 ## Serial protocol
 
 Both UART lines idle high. Bytes are least-significant bit first, with 8 data

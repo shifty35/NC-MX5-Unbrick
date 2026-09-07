@@ -510,6 +510,132 @@ class ProtocolTranscriptTests(unittest.TestCase):
         self.assertTrue(protocol.user_boot_mat_is_blank())
         self.assertEqual(serial.timeout_assignments, 1)
 
+    def test_read_waits_for_selectable_serial_descriptor(self) -> None:
+        class DelayedSerial:
+            reads = 0
+
+            def fileno(self) -> int:
+                return 123
+
+            def read(self, size: int) -> bytes:
+                self.reads += 1
+                return b"" if self.reads == 1 else b"\x06"
+
+        serial = DelayedSerial()
+        sleep = mock.Mock()
+        protocol = flasher.RenesasBootProtocol(serial, sleep=sleep)
+        with mock.patch.object(
+            flasher.select, "select", return_value=([123], [], [])
+        ) as wait:
+            result = protocol._read_exact(1, 1.0, "test ACK")
+
+        self.assertEqual(result, b"\x06")
+        wait.assert_called_once()
+        self.assertGreater(wait.call_args.args[3], 0.0)
+        sleep.assert_not_called()
+        self.assertIs(protocol._selectable_port, True)
+
+    def test_read_uses_short_sleep_for_nonselectable_transport(self) -> None:
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            def sleep(self, duration: float) -> None:
+                self.now += duration
+
+        class DelayedSerial:
+            reads = 0
+
+            def read(self, size: int) -> bytes:
+                self.reads += 1
+                return b"" if self.reads == 1 else b"\x06"
+
+        clock = Clock()
+        protocol = flasher.RenesasBootProtocol(
+            DelayedSerial(),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(protocol._read_exact(1, 1.0, "test ACK"), b"\x06")
+        self.assertEqual(clock.now, flasher.READ_POLL_FALLBACK_SECONDS)
+        self.assertIs(protocol._selectable_port, False)
+
+    def test_program_timing_separates_serial_and_ack_waits(self) -> None:
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            def sleep(self, duration: float) -> None:
+                self.now += duration
+
+        clock = Clock()
+        chunks = (
+            flasher.ProgramChunk(0x0000, bytes(range(128))),
+            flasher.ProgramChunk(0x0080, bytes(reversed(range(128)))),
+        )
+
+        class TimedSerial(ScriptedSerial):
+            flush_calls = 0
+
+            def write(self, data: bytes) -> int:
+                clock.now += 0.002
+                return super().write(data)
+
+            def flush(self) -> None:
+                self.flush_calls += 1
+                clock.now += 0.003
+
+            def read(self, size: int) -> bytes:
+                clock.now += 0.007
+                return super().read(size)
+
+        serial = TimedSerial(
+            [
+                (312_500, b"\x43", b"\x06"),
+                (312_500, flasher.program_frame(chunks[0]), b"\x06"),
+                (312_500, flasher.program_frame(chunks[1]), b"\x06"),
+                (312_500, flasher.program_end_frame(), b"\x06"),
+            ]
+        )
+        serial.baudrate = 312_500
+        protocol = flasher.RenesasBootProtocol(
+            serial,
+            program_baud=312_500,
+            adapter_baud=315_800,
+            fdt_two_stop_bits=True,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+        with mock.patch.object(flasher, "_print_program_timing") as printer:
+            protocol.program(chunks)
+
+        timing = printer.call_args.args[0]
+        self.assertEqual(timing.completed_records, 2)
+        self.assertEqual(timing.total_records, 2)
+        self.assertAlmostEqual(timing.selection_seconds, 0.012)
+        self.assertAlmostEqual(timing.records_seconds, 0.018)
+        self.assertAlmostEqual(timing.termination_seconds, 0.012)
+        self.assertAlmostEqual(timing.record_tx_seconds, 0.004)
+        self.assertAlmostEqual(timing.record_ack_seconds, 0.014)
+        self.assertAlmostEqual(timing.record_other_seconds, 0.0)
+        self.assertAlmostEqual(timing.total_seconds, 0.042)
+        self.assertIn(timing.slowest_record_address, (0x0000, 0x0080))
+        self.assertEqual(serial.flush_calls, 2)
+        self.assertEqual(
+            printer.call_args.kwargs,
+            {
+                "baud": 312_500,
+                "adapter_baud": 315_800,
+                "fdt_two_stop_bits": True,
+            },
+        )
+
 
 class CliSafetyTests(unittest.TestCase):
     class DummyPort:
@@ -736,11 +862,15 @@ class CliSafetyTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("result is UNVERIFIED", stdout.getvalue())
         self.assertIn("External verification is required", stdout.getvalue())
+        self.assertIn("Erase/flash timing summary (complete)", stdout.getvalue())
+        self.assertIn("automatic User/User-Boot MAT erase", stdout.getvalue())
+        self.assertIn("User MAT programming", stdout.getvalue())
         self.assertNotIn("Before normal boot", stdout.getvalue())
         protocol_class.assert_called_once_with(
             mock.ANY,
             program_baud=125_000,
             adapter_baud=125_000,
+            fdt_two_stop_bits=False,
             verbose=False,
         )
 

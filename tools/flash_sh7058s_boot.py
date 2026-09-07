@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import select
 import struct
 import sys
 import time
@@ -29,6 +30,7 @@ PRODUCT_NAME = "R4F70580S"
 TYPICAL_PROGRAM_SECONDS_PER_RECORD = 0.001
 PROGRAM_FRAME_BYTES = 1 + 4 + PROGRAM_UNIT + 1
 SELECTED_RATE_PROBE_COUNT = 3
+READ_POLL_FALLBACK_SECONDS = 0.0005
 
 ERASE_BLOCKS: tuple[tuple[int, int], ...] = (
     (0x000000, 0x000FFF),
@@ -141,6 +143,27 @@ class ImagePlan:
         return sum(self.data) & 0xFFFFFFFF
 
 
+@dataclass(frozen=True)
+class ProgramTiming:
+    completed_records: int
+    total_records: int
+    total_seconds: float
+    selection_seconds: float
+    records_seconds: float
+    termination_seconds: float
+    record_tx_seconds: float
+    record_ack_seconds: float
+    slowest_record_seconds: float
+    slowest_record_address: int | None
+
+    @property
+    def record_other_seconds(self) -> float:
+        return max(
+            0.0,
+            self.records_seconds - self.record_tx_seconds - self.record_ack_seconds,
+        )
+
+
 def checksum8(data: bytes) -> int:
     """Return the Renesas SUM byte which makes the frame sum zero."""
     return (-sum(data)) & 0xFF
@@ -245,6 +268,7 @@ class RenesasBootProtocol:
         *,
         program_baud: int = DEFAULT_PROGRAM_BAUD,
         adapter_baud: int | None = None,
+        fdt_two_stop_bits: bool = False,
         verbose: bool = False,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
@@ -259,15 +283,19 @@ class RenesasBootProtocol:
         self.port = port
         self.program_baud = program_baud
         self.adapter_baud = program_baud if adapter_baud is None else adapter_baud
+        self.fdt_two_stop_bits = fdt_two_stop_bits
         self.verbose = verbose
         self._sleep = sleep
         self._monotonic = monotonic
+        self._selectable_port: bool | None = None
 
     def _log(self, message: str) -> None:
         if self.verbose:
             _emit(message)
 
-    def _write(self, data: bytes, description: str) -> None:
+    def _write(
+        self, data: bytes, description: str, *, wait_for_drain: bool = True
+    ) -> None:
         self._log(
             f"TX {description}: {data.hex(' ')}"
             if len(data) <= 32
@@ -282,13 +310,37 @@ class RenesasBootProtocol:
                 if written <= 0:
                     raise FlashToolError("serial write made no progress")
                 offset += written
-            self.port.flush()
+            if wait_for_drain:
+                self.port.flush()
         except FlashToolError:
             raise
         except Exception as error:
             raise FlashToolError(
                 f"serial write failed during {description}: {error}"
             ) from error
+
+    def _wait_for_readable(self, timeout: float) -> None:
+        """Wait without changing pyserial settings on a live custom-baud port."""
+        if self._selectable_port is not False:
+            try:
+                descriptor = self.port.fileno()
+                select.select([descriptor], [], [], timeout)
+            except (AttributeError, OSError, TypeError, ValueError):
+                # Windows serial handles are not Winsock descriptors, and test or
+                # alternate transports may not expose fileno(). Keep a portable
+                # short-sleep fallback without busy-waiting.
+                if self._selectable_port is None:
+                    _emit(
+                        "Serial RX waits: selectable descriptor unavailable; using "
+                        f"{READ_POLL_FALLBACK_SECONDS * 1000:.1f} ms sleeping polls."
+                    )
+                self._selectable_port = False
+            else:
+                if self._selectable_port is None:
+                    _emit("Serial RX waits: using event-driven select() readiness.")
+                self._selectable_port = True
+                return
+        self._sleep(min(READ_POLL_FALLBACK_SECONDS, timeout))
 
     def _read_exact(self, size: int, timeout: float, description: str) -> bytes:
         deadline = self._monotonic() + timeout
@@ -313,7 +365,7 @@ class RenesasBootProtocol:
             if piece:
                 result.extend(piece)
             else:
-                self._sleep(min(0.005, remaining))
+                self._wait_for_readable(remaining)
         data = bytes(result)
         self._log(
             f"RX {description}: {data.hex(' ')}"
@@ -630,21 +682,88 @@ class RenesasBootProtocol:
         chunks: Sequence[ProgramChunk],
         progress: Callable[[int, int, int], None] | None = None,
     ) -> None:
-        self._write(b"\x43", "user-MAT programming selection")
-        self._expect_ack(0x43, timeout=10.0, description="programming-selection ACK")
         total = len(chunks)
-        for position, chunk in enumerate(chunks, start=1):
-            self._write(program_frame(chunk), f"program 0x{chunk.address:06X}")
-            # Never retry: if an ACK was lost, the page may already be programmed.
+        operation_started = self._monotonic()
+        selection_started = operation_started
+        selection_seconds = 0.0
+        records_seconds = 0.0
+        termination_seconds = 0.0
+        record_tx_seconds = 0.0
+        record_ack_seconds = 0.0
+        completed_records = 0
+        slowest_record_seconds = 0.0
+        slowest_record_address: int | None = None
+
+        try:
+            self._write(b"\x43", "user-MAT programming selection")
             self._expect_ack(
-                0x50,
-                timeout=5.0,
-                description=f"program ACK at 0x{chunk.address:06X}",
+                0x43, timeout=10.0, description="programming-selection ACK"
             )
-            if progress is not None:
-                progress(position, total, chunk.address)
-        self._write(program_end_frame(), "programming termination")
-        self._expect_ack(0x50, timeout=5.0, description="program-termination ACK")
+            selection_seconds = self._monotonic() - selection_started
+
+            records_started = self._monotonic()
+            for position, chunk in enumerate(chunks, start=1):
+                record_started = self._monotonic()
+                tx_started = self._monotonic()
+                try:
+                    # Serial.write() queues the bytes for transmission. Waiting for
+                    # the target ACK below proves that the complete record left the
+                    # adapter, so a per-record tcdrain/flush only serializes host and
+                    # USB-driver scheduling unnecessarily.
+                    self._write(
+                        program_frame(chunk),
+                        f"program 0x{chunk.address:06X}",
+                        wait_for_drain=False,
+                    )
+                finally:
+                    record_tx_seconds += self._monotonic() - tx_started
+
+                ack_started = self._monotonic()
+                try:
+                    # Never retry: if an ACK was lost, the page may already be
+                    # programmed.
+                    self._expect_ack(
+                        0x50,
+                        timeout=5.0,
+                        description=f"program ACK at 0x{chunk.address:06X}",
+                    )
+                finally:
+                    record_ack_seconds += self._monotonic() - ack_started
+                completed_records = position
+
+                record_seconds = self._monotonic() - record_started
+                if record_seconds > slowest_record_seconds:
+                    slowest_record_seconds = record_seconds
+                    slowest_record_address = chunk.address
+                if progress is not None:
+                    progress(position, total, chunk.address)
+            records_seconds = self._monotonic() - records_started
+
+            termination_started = self._monotonic()
+            self._write(program_end_frame(), "programming termination")
+            self._expect_ack(0x50, timeout=5.0, description="program-termination ACK")
+            termination_seconds = self._monotonic() - termination_started
+        finally:
+            total_seconds = self._monotonic() - operation_started
+            if completed_records and records_seconds == 0.0:
+                records_seconds = max(0.0, total_seconds - selection_seconds)
+            _print_program_timing(
+                ProgramTiming(
+                    completed_records=completed_records,
+                    total_records=total,
+                    total_seconds=total_seconds,
+                    selection_seconds=selection_seconds,
+                    records_seconds=records_seconds,
+                    termination_seconds=termination_seconds,
+                    record_tx_seconds=record_tx_seconds,
+                    record_ack_seconds=record_ack_seconds,
+                    slowest_record_seconds=slowest_record_seconds,
+                    slowest_record_address=slowest_record_address,
+                ),
+                baud=self.program_baud,
+                adapter_baud=self.adapter_baud,
+                fdt_two_stop_bits=self.fdt_two_stop_bits,
+            )
 
     def user_mat_checksum(self) -> int:
         payload = self._request_frame(
@@ -866,19 +985,35 @@ def _print_plan(
 
 
 def _progress_printer(
-    label: str = "Programming", unit: int = PROGRAM_UNIT
+    label: str = "Programming",
+    unit: int = PROGRAM_UNIT,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> Callable[[int, int, int], None]:
     last_percent = -1
+    started = monotonic()
+    last_reported = started
+    last_position = 0
 
     def report(position: int, total: int, address: int) -> None:
-        nonlocal last_percent
+        nonlocal last_percent, last_reported, last_position
         percent = position * 100 // total
         if percent != last_percent or position == total:
+            now = monotonic()
+            elapsed = now - started
+            interval = now - last_reported
+            interval_records = position - last_position
+            rate = interval_records / interval if interval > 0 else 0.0
+            eta = (total - position) * elapsed / position if position else 0.0
             _emit(
                 f"{label}: {percent:3d}% "
-                f"({position:,}/{total:,}, through 0x{address + unit - 1:06X})"
+                f"({position:,}/{total:,}, through 0x{address + unit - 1:06X}); "
+                f"elapsed {elapsed:.1f} s, interval {rate:.1f} records/s, "
+                f"ETA {eta:.1f} s"
             )
             last_percent = percent
+            last_reported = now
+            last_position = position
 
     return report
 
@@ -904,12 +1039,118 @@ def _estimated_program_seconds(
     adapter_baud: int | None = None,
     fdt_two_stop_bits: bool,
 ) -> float:
+    return (
+        _estimated_program_wire_seconds(
+            record_count,
+            baud,
+            adapter_baud=adapter_baud,
+            fdt_two_stop_bits=fdt_two_stop_bits,
+        )
+        + record_count * TYPICAL_PROGRAM_SECONDS_PER_RECORD
+    )
+
+
+def _estimated_program_wire_seconds(
+    record_count: int,
+    baud: int,
+    *,
+    adapter_baud: int | None = None,
+    fdt_two_stop_bits: bool,
+) -> float:
     host_baud = baud if adapter_baud is None else adapter_baud
     host_bits_per_byte = 11 if fdt_two_stop_bits else 10
-    selected_wire_seconds = (
+    return record_count * (
         PROGRAM_FRAME_BYTES * host_bits_per_byte / host_baud + 10 / baud
     )
-    return record_count * (selected_wire_seconds + TYPICAL_PROGRAM_SECONDS_PER_RECORD)
+
+
+def _print_program_timing(
+    timing: ProgramTiming,
+    *,
+    baud: int,
+    adapter_baud: int,
+    fdt_two_stop_bits: bool,
+) -> None:
+    modeled_wire_seconds = _estimated_program_wire_seconds(
+        timing.completed_records,
+        baud,
+        adapter_baud=adapter_baud,
+        fdt_two_stop_bits=fdt_two_stop_bits,
+    )
+    wire_delta_seconds = timing.records_seconds - modeled_wire_seconds
+    divisor = timing.completed_records or 1
+    status = (
+        "complete"
+        if timing.completed_records == timing.total_records
+        else "stopped early"
+    )
+    _emit(
+        "Programming timing breakdown "
+        f"({timing.completed_records:,}/{timing.total_records:,} records, {status}):"
+    )
+    _emit(f"  total programming call:       {timing.total_seconds:9.3f} s")
+    _emit(f"  selection command + ACK:      {timing.selection_seconds:9.3f} s")
+    _emit(f"  record loop:                  {timing.records_seconds:9.3f} s")
+    _emit(
+        f"    serial write queue calls:   {timing.record_tx_seconds:9.3f} s "
+        f"({timing.record_tx_seconds * 1000 / divisor:.3f} ms/record)"
+    )
+    _emit(
+        f"    TX completion / ECU / ACK:  {timing.record_ack_seconds:9.3f} s "
+        f"({timing.record_ack_seconds * 1000 / divisor:.3f} ms/record)"
+    )
+    _emit(
+        f"    host framing/progress:      {timing.record_other_seconds:9.3f} s "
+        f"({timing.record_other_seconds * 1000 / divisor:.3f} ms/record)"
+    )
+    _emit(f"  termination command + ACK:    {timing.termination_seconds:9.3f} s")
+    _emit(f"  modeled record wire time:     {modeled_wire_seconds:9.3f} s")
+    _emit(f"  record-loop minus wire model: {wire_delta_seconds:9.3f} s")
+    if timing.slowest_record_address is not None:
+        _emit(
+            f"  slowest completed record:     {timing.slowest_record_seconds * 1000:9.3f} ms "
+            f"at 0x{timing.slowest_record_address:06X}"
+        )
+
+
+def _timed_phase(
+    label: str,
+    operation: Callable[[], Any],
+    timings: list[tuple[str, float, str]],
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> Any:
+    started = monotonic()
+    try:
+        result = operation()
+    except BaseException:
+        elapsed = monotonic() - started
+        timings.append((label, elapsed, "failed"))
+        _emit(f"Timing: {label} failed after {elapsed:.3f} s.")
+        raise
+    elapsed = monotonic() - started
+    timings.append((label, elapsed, "complete"))
+    _emit(f"Timing: {label} completed in {elapsed:.3f} s.")
+    return result
+
+
+def _print_phase_timing_summary(
+    timings: Sequence[tuple[str, float, str]],
+    total_seconds: float,
+    *,
+    status: str,
+) -> None:
+    _emit(f"Erase/flash timing summary ({status}):")
+    for label, elapsed, phase_status in timings:
+        suffix = "" if phase_status == "complete" else f" ({phase_status})"
+        _emit(f"  {label + ':':32s} {elapsed:9.3f} s{suffix}")
+    measured_phase_seconds = sum(elapsed for _, elapsed, _ in timings)
+    _emit(f"  {'measured phases:':32s} {measured_phase_seconds:9.3f} s")
+    _emit(f"  {'overall after confirmation:':32s} {total_seconds:9.3f} s")
+    _emit(
+        f"  {'between-phase/report overhead:':32s} "
+        f"{max(0.0, total_seconds - measured_phase_seconds):9.3f} s"
+    )
 
 
 def _estimated_readback_wire_seconds(
@@ -1038,6 +1279,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     failure_phase: str | None = None
     boot_session_started = False
     port: Any | None = None
+    destructive_started: float | None = None
+    phase_timings: list[tuple[str, float, str]] = []
+    timing_summary_printed = False
+
+    def print_timing_summary(status: str) -> None:
+        nonlocal timing_summary_printed
+        if destructive_started is None or timing_summary_printed:
+            return
+        _print_phase_timing_summary(
+            phase_timings,
+            time.monotonic() - destructive_started,
+            status=status,
+        )
+        timing_summary_printed = True
+
     try:
         plan = build_image_plan(args.image)
         _print_plan(
@@ -1064,9 +1320,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             port,
             program_baud=args.program_baud,
             adapter_baud=adapter_baud,
+            fdt_two_stop_bits=args.fdt_two_stop_bits,
             verbose=args.verbose,
         )
-        protocol.connect_cold_boot()
+        connection_timings: list[tuple[str, float, str]] = []
+        _timed_phase(
+            "cold boot handshake",
+            protocol.connect_cold_boot,
+            connection_timings,
+        )
 
         if not args.yes:
             _emit("\nTARGET VALIDATED; NEXT COMMAND IS DESTRUCTIVE:")
@@ -1098,16 +1360,35 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         # Set this before H40: a transport failure can make command acceptance
         # unknowable even when no response reaches the host.
+        destructive_started = time.monotonic()
         failure_phase = "automatic erase"
-        protocol.transition_and_auto_erase()
+        _timed_phase(
+            "automatic User/User-Boot MAT erase",
+            protocol.transition_and_auto_erase,
+            phase_timings,
+        )
         failure_phase = "post-erase status check"
-        protocol.require_program_erase_ready()
+        _timed_phase(
+            "post-erase status inquiry",
+            protocol.require_program_erase_ready,
+            phase_timings,
+        )
         failure_phase = "post-erase blank checks"
-        if not protocol.user_boot_mat_is_blank():
+        user_boot_blank = _timed_phase(
+            "User Boot MAT blank check",
+            protocol.user_boot_mat_is_blank,
+            phase_timings,
+        )
+        if not user_boot_blank:
             raise ProtocolError(
                 "target acknowledged automatic erase but User Boot MAT is not blank"
             )
-        if not protocol.user_mat_is_blank():
+        user_mat_blank = _timed_phase(
+            "User MAT blank check",
+            protocol.user_mat_is_blank,
+            phase_timings,
+        )
+        if not user_mat_blank:
             raise ProtocolError(
                 "target acknowledged automatic erase but User MAT is not blank"
             )
@@ -1120,11 +1401,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _emit(
             f"Programming {plan.programmed_bytes / 1024:.2f} KiB in "
-            f"{len(plan.chunks):,} records (wire time plus typical flash time: "
-            f"{estimated_seconds:.0f} seconds)..."
+            f"{len(plan.chunks):,} records (programming-phase estimate only: "
+            f"{estimated_seconds:.0f} seconds; excludes erase, checks, and "
+            "verification)..."
         )
         failure_phase = "programming"
-        protocol.program(plan.chunks, _progress_printer())
+        _timed_phase(
+            "User MAT programming",
+            lambda: protocol.program(plan.chunks, _progress_printer()),
+            phase_timings,
+        )
         failure_phase = "verification"
 
         if args.verify == "readback":
@@ -1138,14 +1424,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"byte-for-byte (about {readback_seconds:.0f} seconds of serial "
                 "wire time)..."
             )
-            target_sha256 = protocol.verify_user_mat(
-                plan.data,
-                _progress_printer("Readback", READBACK_UNIT),
+            target_sha256 = _timed_phase(
+                "full User MAT readback verification",
+                lambda: protocol.verify_user_mat(
+                    plan.data,
+                    _progress_printer("Readback", READBACK_UNIT),
+                ),
+                phase_timings,
             )
             _emit(f"Byte-for-byte readback verified; SHA-256 {target_sha256}.")
         elif args.verify == "sum":
             _emit("Checking the complete User-MAT additive sum...")
-            target_sum = protocol.user_mat_checksum()
+            target_sum = _timed_phase(
+                "User MAT additive checksum verification",
+                protocol.user_mat_checksum,
+                phase_timings,
+            )
             if target_sum != plan.user_mat_sum:
                 raise ProtocolError(
                     f"verification failed: image sum 0x{plan.user_mat_sum:08X}, "
@@ -1159,6 +1453,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _emit("External verification is required before attempting a normal boot.")
 
+        print_timing_summary("complete")
         if args.verify != "none":
             _emit(
                 "Before normal boot, hold reset or remove power, restore the normal "
@@ -1168,6 +1463,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except KeyboardInterrupt:
         _emit("\nInterrupted.", file=sys.stderr)
+        print_timing_summary("interrupted")
         if failure_phase is not None:
             _print_post_destructive_recovery_warning(failure_phase)
         elif boot_session_started:
@@ -1175,6 +1471,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
     except FlashToolError as error:
         _emit(f"error: {error}", file=sys.stderr)
+        print_timing_summary("failed")
         if failure_phase is not None:
             _print_post_destructive_recovery_warning(failure_phase)
         elif boot_session_started:
@@ -1182,6 +1479,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except Exception as error:
         _emit(f"unexpected error: {type(error).__name__}: {error}", file=sys.stderr)
+        print_timing_summary("failed")
         if failure_phase is not None:
             _print_post_destructive_recovery_warning(failure_phase)
         elif boot_session_started:
